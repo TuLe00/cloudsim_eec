@@ -115,8 +115,244 @@ static void Greedy_TrySleep(MachineId_t mid, vector<VMId_t>& all_vms) {
 }
 
 // ============================================================================
-// 2. PLACEHOLDERS FOR OTHER ALGORITHMS (PMAPPER, EECO, PABFD)
+// 2. PMAPPER IMPLEMENTATION
 // ============================================================================
+//
+// pMapper: Power-aware VM placement using Best-Fit Decreasing (BFD).
+//
+// New task placement:
+//   Among active (S0) machines, pick the most-utilized one that can still fit
+//   the task. This consolidates load onto fewer hosts, leaving lightly-used
+//   machines idle so they can be powered down.
+//
+// Periodic consolidation:
+//   Machines with utilization < PMAPPER_U_LOW are candidates.
+//   Their VMs are migrated to the most-utilized machine that still has
+//   headroom (< PMAPPER_U_HIGH). Emptied machines are put to sleep (S5).
+// ============================================================================
+
+static const double PMAPPER_U_LOW  = 0.20;   // below this → consolidation candidate
+static const double PMAPPER_U_HIGH = 0.85;   // above this → skip as migration target
+
+static map<MachineId_t, vector<VMId_t>> pm_m2v;
+static map<TaskId_t, VMId_t>            pm_task_to_vm;
+static vector<TaskId_t>                 pm_pending;
+static set<MachineId_t>                 pm_transitioning;
+static set<VMId_t>                      pm_migrating;
+
+static Priority_t PMapper_SLAPrio(SLAType_t sla) {
+    if (sla == SLA0 || sla == SLA1) return HIGH_PRIORITY;
+    if (sla == SLA2)                return MID_PRIORITY;
+    return LOW_PRIORITY;
+}
+
+static bool PMapper_VMCPUOk(VMType_t vm, CPUType_t cpu) {
+    if (vm == AIX) return cpu == POWER;
+    if (vm == WIN) return cpu == ARM || cpu == X86;
+    return true;
+}
+
+static VMId_t PMapper_EnsureVM(MachineId_t mid, VMType_t vt, CPUType_t ct,
+                                vector<VMId_t>& all_vms) {
+    for (VMId_t vm : pm_m2v[mid]) {
+        if (pm_migrating.count(vm)) continue;
+        VMInfo_t vi = VM_GetInfo(vm);
+        if (vi.vm_type == vt && vi.cpu == ct) return vm;
+    }
+    VMId_t vm = VM_Create(vt, ct);
+    VM_Attach(vm, mid);
+    all_vms.push_back(vm);
+    pm_m2v[mid].push_back(vm);
+    return vm;
+}
+
+static bool PMapper_CanHost(MachineId_t mid, TaskId_t task) {
+    MachineInfo_t mi = Machine_GetInfo(mid);
+    if (mi.s_state != S0) return false;
+    CPUType_t rc = RequiredCPUType(task);
+    VMType_t  rv = RequiredVMType(task);
+    if (mi.cpu != rc) return false;
+    if (!PMapper_VMCPUOk(rv, rc)) return false;
+    bool has_vm = false;
+    for (VMId_t vm : pm_m2v[mid]) {
+        if (pm_migrating.count(vm)) continue;
+        VMInfo_t vi = VM_GetInfo(vm);
+        if (vi.vm_type == rv && vi.cpu == rc) { has_vm = true; break; }
+    }
+    unsigned need = GetTaskMemory(task) + (has_vm ? 0 : VM_MEMORY_OVERHEAD);
+    return mi.memory_size >= mi.memory_used + need;
+}
+
+// BFD: pick the most-utilized S0 machine that can still host the task
+static MachineId_t PMapper_BestFit(TaskId_t task, const vector<MachineId_t>& mlist) {
+    MachineId_t best      = MachineId_t(UINT_MAX);
+    double      best_util = -1.0;
+    for (MachineId_t mid : mlist) {
+        if (!PMapper_CanHost(mid, task)) continue;
+        MachineInfo_t mi = Machine_GetInfo(mid);
+        double util = (mi.num_cpus > 0) ? (double)mi.active_tasks / mi.num_cpus : 0.0;
+        if (util > best_util) { best_util = util; best = mid; }
+    }
+    return best;
+}
+
+// Estimate memory footprint of a VM: sum of its tasks' requirements + overhead
+static unsigned PMapper_VMMemory(VMId_t vm) {
+    VMInfo_t vi = VM_GetInfo(vm);
+    unsigned total = VM_MEMORY_OVERHEAD;
+    for (TaskId_t t : vi.active_tasks) total += GetTaskMemory(t);
+    return total;
+}
+
+void PMapper_Init(vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    // Start all machines active; consolidation will power down idle ones
+    for (MachineId_t mid : machines) {
+        MachineInfo_t mi = Machine_GetInfo(mid);
+        Machine_SetState(mid, S0);
+        VMId_t vm = VM_Create((mi.cpu == POWER) ? AIX : LINUX, mi.cpu);
+        VM_Attach(vm, mid);
+        vms.push_back(vm);
+        pm_m2v[mid].push_back(vm);
+        for (unsigned c = 0; c < mi.num_cpus; c++)
+            Machine_SetCorePerformance(mid, c, P0);
+    }
+}
+
+void PMapper_NewTask(Time_t now, TaskId_t task,
+                     vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    MachineId_t mid = PMapper_BestFit(task, machines);
+    if (mid == MachineId_t(UINT_MAX)) {
+        // No suitable S0 host — wake the first sleeping machine of the right type
+        CPUType_t rc = RequiredCPUType(task);
+        for (MachineId_t m : machines) {
+            if (pm_transitioning.count(m)) continue;
+            MachineInfo_t mi = Machine_GetInfo(m);
+            if (mi.cpu == rc && mi.s_state != S0) {
+                Machine_SetState(m, S0);
+                for (unsigned c = 0; c < mi.num_cpus; c++)
+                    Machine_SetCorePerformance(m, c, P0);
+                pm_transitioning.insert(m);
+                break;
+            }
+        }
+        pm_pending.push_back(task);
+    } else {
+        VMId_t vm = PMapper_EnsureVM(mid, RequiredVMType(task),
+                                      RequiredCPUType(task), vms);
+        VM_AddTask(vm, task, PMapper_SLAPrio(RequiredSLA(task)));
+        pm_task_to_vm[task] = vm;
+    }
+}
+
+void PMapper_PeriodicCheck(Time_t now,
+                            vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    // --- 1. Consolidation: drain under-utilized S0 machines ------------------
+    // Build list of running machines sorted by utilization ascending
+    vector<pair<double, MachineId_t>> running_by_util;
+    for (MachineId_t mid : machines) {
+        if (pm_transitioning.count(mid)) continue;
+        MachineInfo_t mi = Machine_GetInfo(mid);
+        if (mi.s_state != S0) continue;
+        double util = (mi.num_cpus > 0) ? (double)mi.active_tasks / mi.num_cpus : 0.0;
+        running_by_util.push_back({util, mid});
+    }
+    sort(running_by_util.begin(), running_by_util.end());  // least-loaded first
+
+    for (auto& [util, src] : running_by_util) {
+        if (util >= PMAPPER_U_LOW) break;  // rest are above threshold
+        if (pm_transitioning.count(src)) continue;
+        MachineInfo_t smi = Machine_GetInfo(src);
+
+        // Try to migrate every active VM off src
+        bool all_migrated = true;
+        for (VMId_t vm : pm_m2v[src]) {
+            if (pm_migrating.count(vm)) continue;
+            VMInfo_t vi = VM_GetInfo(vm);
+            if (vi.active_tasks.empty()) continue;  // idle — will be shut down
+
+            unsigned vm_mem = PMapper_VMMemory(vm);
+
+            // Destination: most-utilized S0 machine with headroom and same CPU
+            MachineId_t dst      = MachineId_t(UINT_MAX);
+            double      dst_util = -1.0;
+            for (MachineId_t cand : machines) {
+                if (cand == src || pm_transitioning.count(cand)) continue;
+                MachineInfo_t cmi = Machine_GetInfo(cand);
+                if (cmi.s_state != S0 || cmi.cpu != smi.cpu) continue;
+                if (cmi.memory_size < cmi.memory_used + vm_mem) continue;
+                double cu = (cmi.num_cpus > 0)
+                            ? (double)cmi.active_tasks / cmi.num_cpus : 0.0;
+                if (cu >= PMAPPER_U_HIGH) continue;
+                if (cu > dst_util) { dst_util = cu; dst = cand; }
+            }
+            if (dst == MachineId_t(UINT_MAX)) { all_migrated = false; continue; }
+
+            VM_Migrate(vm, dst);
+            pm_migrating.insert(vm);
+            pm_m2v[dst].push_back(vm);
+            pm_m2v[src].erase(remove(pm_m2v[src].begin(), pm_m2v[src].end(), vm),
+                               pm_m2v[src].end());
+        }
+
+        if (!all_migrated) continue;
+
+        // Shut down idle VMs and power off the machine
+        vector<VMId_t> keep;
+        for (VMId_t vm : pm_m2v[src]) {
+            if (pm_migrating.count(vm)) { keep.push_back(vm); continue; }
+            VM_Shutdown(vm);
+            vms.erase(remove(vms.begin(), vms.end(), vm), vms.end());
+        }
+        pm_m2v[src] = keep;
+        if (Machine_GetInfo(src).active_vms == 0) {
+            Machine_SetState(src, S5);
+            pm_transitioning.insert(src);
+        }
+    }
+
+    // --- 2. Retry pending tasks ----------------------------------------------
+    vector<TaskId_t> still_pending;
+    for (TaskId_t t : pm_pending) {
+        MachineId_t mid = PMapper_BestFit(t, machines);
+        if (mid != MachineId_t(UINT_MAX)) {
+            VMId_t vm = PMapper_EnsureVM(mid, RequiredVMType(t),
+                                          RequiredCPUType(t), vms);
+            VM_AddTask(vm, t, PMapper_SLAPrio(RequiredSLA(t)));
+            pm_task_to_vm[t] = vm;
+        } else {
+            CPUType_t rc = RequiredCPUType(t);
+            for (MachineId_t m : machines) {
+                if (pm_transitioning.count(m)) continue;
+                MachineInfo_t mi = Machine_GetInfo(m);
+                if (mi.cpu == rc && mi.s_state != S0) {
+                    Machine_SetState(m, S0);
+                    for (unsigned c = 0; c < mi.num_cpus; c++)
+                        Machine_SetCorePerformance(m, c, P0);
+                    pm_transitioning.insert(m);
+                    break;
+                }
+            }
+            still_pending.push_back(t);
+        }
+    }
+    pm_pending = still_pending;
+}
+
+void PMapper_TaskComplete(Time_t now, TaskId_t task,
+                           vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    pm_task_to_vm.erase(task);
+}
+
+void PMapper_MigrationComplete(VMId_t vm,
+                                vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    pm_migrating.erase(vm);
+}
+
+void PMapper_Shutdown(vector<VMId_t>& vms) {
+    for (VMId_t vm : vms) {
+        if (VM_GetInfo(vm).active_tasks.empty()) VM_Shutdown(vm);
+    }
+}
 
 
 
@@ -439,6 +675,9 @@ void Scheduler::Init() {
                 for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(mid, c, P0);
             }
             break;
+        case PMAPPER:
+            PMapper_Init(machines, vms);
+            break;
         case EECO:
             EECO_Init(machines, vms);
             break;
@@ -467,6 +706,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             greedy_task_to_vm[task_id] = vm;
         }
     }
+    else if (CURRENT_ALGO == PMAPPER) {
+        PMapper_NewTask(now, task_id, machines, vms);
+    }
     else if(CURRENT_ALGO == EECO){
         EECO_NewTask(now, task_id, machines, vms);
     }
@@ -486,10 +728,12 @@ void Scheduler::PeriodicCheck(Time_t now) {
         greedy_pending = rem;
         for (MachineId_t mid : machines) Greedy_TrySleep(mid, vms);
     }
+    else if (CURRENT_ALGO == PMAPPER) {
+        PMapper_PeriodicCheck(now, machines, vms);
+    }
     else if (CURRENT_ALGO == EECO){
         EECO_PeriodicCheck(now, machines, vms);
     }
-    
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
@@ -501,17 +745,21 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
             Greedy_TrySleep(mid, vms);
         }
     }
+    else if (CURRENT_ALGO == PMAPPER) {
+        PMapper_TaskComplete(now, task_id, machines, vms);
+    }
     else if (CURRENT_ALGO == EECO){
         EECO_TaskComplete(now, task_id, machines, vms);
     }
-    
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     if (CURRENT_ALGO == CUSTOM_GREEDY) greedy_migrating.erase(vm_id);
+    else if (CURRENT_ALGO == PMAPPER)  PMapper_MigrationComplete(vm_id, machines, vms);
 }
 
 void Scheduler::Shutdown(Time_t time) {
+    if (CURRENT_ALGO == PMAPPER) { PMapper_Shutdown(vms); return; }
     for (VMId_t vm : vms) {
         if (VM_GetInfo(vm).active_tasks.empty()) VM_Shutdown(vm);
     }
@@ -534,6 +782,14 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
         greedy_waking.erase(machine_id);
         MachineInfo_t mi = Machine_GetInfo(machine_id);
         for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(machine_id, c, P0);
+    }
+    else if (CURRENT_ALGO == PMAPPER) {
+        pm_transitioning.erase(machine_id);
+        MachineInfo_t mi = Machine_GetInfo(machine_id);
+        if (mi.s_state == S0) {
+            for (unsigned c = 0; c < mi.num_cpus; c++)
+                Machine_SetCorePerformance(machine_id, c, P0);
+        }
     }
     else if (CURRENT_ALGO == EECO) {
         eeco_transitioning.erase(machine_id);  // Remove from transitioning set
