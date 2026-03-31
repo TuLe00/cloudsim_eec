@@ -12,11 +12,12 @@
 #include <climits>
 #include <iostream>
 #include <string>
+#include <cmath>
 
 using namespace std;
 
 typedef enum { CUSTOM_GREEDY, PMAPPER, EECO, PABFD } AlgorithmType;
-static AlgorithmType CURRENT_ALGO = CUSTOM_GREEDY;
+static AlgorithmType CURRENT_ALGO = EECO;
 
 // ============================================================================
 // 1. CUSTOM_GREEDY IMPLEMENTATION
@@ -117,7 +118,305 @@ static void Greedy_TrySleep(MachineId_t mid, vector<VMId_t>& all_vms) {
 // 2. PLACEHOLDERS FOR OTHER ALGORITHMS (PMAPPER, EECO, PABFD)
 // ============================================================================
 
-// Add your research-based PABFD logic here later...
+
+
+// ============================================================================
+// 3. EECO IMPLEMENTATION
+// ============================================================================
+//
+// Three-tier model:
+//   Running     (S0)  — hosts actively serving tasks
+//   Intermediate (S3) — standby hosts, fast to wake (~seconds)
+//   Switched off (S5) — deep sleep, slow to wake
+//
+// Tier sizes are recomputed on every PeriodicCheck using EECO formulae:
+//
+//   U_cur   = current cluster utilization  (active_tasks / capacity)
+//   N_run   = ceil(U_cur / U_target)       running hosts needed
+//   N_inter = ceil(alpha * N_run)           intermediate buffer (alpha ∈ [0.1, 0.3])
+//   N_off   = Total - N_run - N_inter
+//
+// No VM migration. Tasks are placed on any S0 machine with capacity.
+// When workload rises, intermediate hosts wake (S3→S0) first.
+// When workload falls, excess running hosts demote to S3, then S5.
+// ============================================================================
+
+// ---- Tunables ---------------------------------------------------------------
+static const double EECO_U_TARGET = 0.70;  // target utilization for running tier
+static const double EECO_ALPHA    = 0.20;  // intermediate tier = 20% of running tier
+// -----------------------------------------------------------------------------
+
+static map<MachineId_t, vector<VMId_t>> eeco_m2v;
+static map<TaskId_t, VMId_t>            eeco_task_to_vm;
+static vector<TaskId_t>                 eeco_pending;
+static set<MachineId_t>                 eeco_transitioning;  // Track machines currently changing state
+
+// Helper: map SLA → priority (same logic as Greedy)
+static Priority_t EECO_SLAPrio(SLAType_t sla) {
+    if (sla == SLA0 || sla == SLA1) return HIGH_PRIORITY;
+    if (sla == SLA2)                return MID_PRIORITY;
+    return LOW_PRIORITY;
+}
+
+// Helper: find or create a VM of the right type on a machine
+static VMId_t EECO_EnsureVM(MachineId_t mid, VMType_t vt, CPUType_t ct,
+                             vector<VMId_t>& all_vms) {
+    for (VMId_t vm : eeco_m2v[mid]) {
+        VMInfo_t vi = VM_GetInfo(vm);
+        if (vi.vm_type == vt && vi.cpu == ct) return vm;
+    }
+    VMId_t vm = VM_Create(vt, ct);
+    VM_Attach(vm, mid);
+    all_vms.push_back(vm);
+    eeco_m2v[mid].push_back(vm);
+    return vm;
+}
+
+// Helper: can this machine accept this task right now?
+static bool EECO_CanHost(MachineId_t mid, TaskId_t task) {
+    MachineInfo_t mi = Machine_GetInfo(mid);
+    if (mi.s_state != S0)          return false;
+    if (mi.cpu != RequiredCPUType(task)) return false;
+
+    VMType_t vt = RequiredVMType(task);
+    CPUType_t ct = RequiredCPUType(task);
+    if (vt == AIX && ct != POWER)  return false;
+
+    // Check memory: need task memory + overhead if no matching VM yet
+    bool has_vm = false;
+    for (VMId_t vm : eeco_m2v[mid]) {
+        VMInfo_t vi = VM_GetInfo(vm);
+        if (vi.vm_type == vt && vi.cpu == ct) { has_vm = true; break; }
+    }
+    unsigned need = GetTaskMemory(task) + (has_vm ? 0 : VM_MEMORY_OVERHEAD);
+    return mi.memory_size >= mi.memory_used + need;
+}
+
+// Helper: pick the best running machine for a task (first-fit among S0 hosts)
+static MachineId_t EECO_FindHost(TaskId_t task, const vector<MachineId_t>& mlist) {
+    MachineId_t best = MachineId_t(UINT_MAX);
+    unsigned    best_load = UINT_MAX;
+    for (MachineId_t mid : mlist) {
+        if (!EECO_CanHost(mid, task)) continue;
+        unsigned load = Machine_GetInfo(mid).active_tasks;
+        if (load < best_load) { best = mid; best_load = load; }
+    }
+    return best;
+}
+
+// Core EECO tier-rebalancing logic — called from PeriodicCheck
+static void EECO_Rebalance(const vector<MachineId_t>& mlist, vector<VMId_t>& all_vms) {
+    unsigned total = (unsigned)mlist.size();
+    if (total == 0) return;
+
+    // ---- Tally tiers first --------------------------------------------------
+    vector<MachineId_t> running, intermediate, off_hosts;
+    for (MachineId_t mid : mlist) {
+        MachineInfo_t mi = Machine_GetInfo(mid);
+        if      (mi.s_state == S0) running.push_back(mid);
+        else if (mi.s_state == S3) intermediate.push_back(mid);
+        else                       off_hosts.push_back(mid);
+    }
+
+    // ---- Measure utilization ------------------------------------------------
+    unsigned cap_sum  = 0;
+    unsigned task_sum = 0;
+    for (MachineId_t mid : running) {
+        MachineInfo_t mi = Machine_GetInfo(mid);
+        cap_sum  += mi.num_cpus;
+        task_sum += mi.active_tasks;
+    }
+    double U_cur = (cap_sum > 0) ? (double)task_sum / (double)cap_sum : 0.0;
+
+    // ---- Compute target tier sizes ------------------------------------------
+    // How many running hosts are needed to serve current load at U_TARGET?
+    // Derived from: U_cur * N_run_cur / U_TARGET = N_run_target
+    unsigned N_run_cur = (unsigned)running.size();
+    unsigned N_run_target;
+
+    if (U_cur == 0.0) {
+        N_run_target = 1;  // keep at least one warm
+    } else {
+        N_run_target = (unsigned)ceil((U_cur / EECO_U_TARGET) * (double)N_run_cur);
+    }
+
+    // Hard clamp: can't exceed total, must be at least 1
+    N_run_target = max(1u, min(N_run_target, total));
+
+    // Intermediate buffer gets what's left after running, capped by ALPHA
+    unsigned headroom       = total - N_run_target;
+    unsigned N_inter_target = min((unsigned)ceil(EECO_ALPHA * (double)N_run_target), headroom);
+
+    // ---- Step 1: promote intermediate → running if under-supplied -----------
+    if (N_run_cur < N_run_target) {
+        unsigned need = N_run_target - N_run_cur;
+        for (unsigned i = 0; i < need && i < intermediate.size(); i++) {
+            MachineId_t mid = intermediate[i];
+            if (!eeco_transitioning.count(mid)) {
+                Machine_SetState(mid, S0);
+                MachineInfo_t mi = Machine_GetInfo(mid);
+                for (unsigned c = 0; c < mi.num_cpus; c++)
+                    Machine_SetCorePerformance(mid, c, P0);
+                eeco_transitioning.insert(mid);
+            }
+        }
+        // If intermediate ran dry, pull from off_hosts too
+        if (need > intermediate.size()) {
+            unsigned still_need = need - (unsigned)intermediate.size();
+            for (unsigned i = 0; i < still_need && i < off_hosts.size(); i++) {
+                MachineId_t mid = off_hosts[i];
+                if (!eeco_transitioning.count(mid)) {
+                    Machine_SetState(mid, S0);
+                    MachineInfo_t mi = Machine_GetInfo(mid);
+                    for (unsigned c = 0; c < mi.num_cpus; c++)
+                        Machine_SetCorePerformance(mid, c, P0);
+                    eeco_transitioning.insert(mid);
+                }
+            }
+        }
+    }
+
+    // ---- Step 2: promote off → intermediate if buffer is thin ---------------
+    unsigned inter_cur = (unsigned)intermediate.size();
+    if (inter_cur < N_inter_target) {
+        unsigned need = N_inter_target - inter_cur;
+        for (unsigned i = 0; i < need && i < off_hosts.size(); i++) {
+            MachineId_t mid = off_hosts[i];
+            if (!eeco_transitioning.count(mid)) {
+                Machine_SetState(mid, S3);
+                eeco_transitioning.insert(mid);
+            }
+        }
+    }
+
+    // ---- Step 3: demote surplus running → intermediate (ONLY if idle) -------
+    if (N_run_cur > N_run_target) {
+        // Sort so we try to demote least-loaded first
+        vector<MachineId_t> candidates = running;
+        sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b){
+            return Machine_GetInfo(a).active_tasks < Machine_GetInfo(b).active_tasks;
+        });
+        unsigned demoted = 0;
+        unsigned surplus = N_run_cur - N_run_target;
+        for (MachineId_t mid : candidates) {
+            if (demoted >= surplus) break;
+            if (eeco_transitioning.count(mid)) continue;  // Skip if transitioning
+            MachineInfo_t mi = Machine_GetInfo(mid);
+            if (mi.active_tasks > 0) continue;  // never evict a busy host
+            for (VMId_t vm : eeco_m2v[mid]) {
+                if (VM_GetInfo(vm).active_tasks.empty()) {
+                    VM_Shutdown(vm);
+                    all_vms.erase(remove(all_vms.begin(), all_vms.end(), vm), all_vms.end());
+                }
+            }
+            eeco_m2v[mid].clear();
+            Machine_SetState(mid, S3);
+            eeco_transitioning.insert(mid);
+            demoted++;
+        }
+    }
+
+    // ---- Step 4: demote surplus intermediate → off --------------------------
+    vector<MachineId_t> inter_now;
+    for (MachineId_t mid : mlist)
+        if (Machine_GetInfo(mid).s_state == S3) inter_now.push_back(mid);
+
+    if ((unsigned)inter_now.size() > N_inter_target) {
+        unsigned surplus = (unsigned)inter_now.size() - N_inter_target;
+        for (unsigned i = 0; i < surplus && i < inter_now.size(); i++) {
+            MachineId_t mid = inter_now[i];
+            if (!eeco_transitioning.count(mid)) {
+                Machine_SetState(mid, S5);
+                eeco_transitioning.insert(mid);
+            }
+        }
+    }
+}
+
+// Init funciton to go into switch logic
+void EECO_Init(vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    unsigned total = (unsigned)machines.size();
+    unsigned run_n   = max(1u, total);
+    unsigned inter_n = 0;
+
+    for (unsigned i = 0; i < total; i++) {
+        MachineId_t mid = machines[i];
+        MachineInfo_t mi = Machine_GetInfo(mid);
+
+        if (i < run_n) {
+            // Running tier — create a starter VM and set cores to P0
+            Machine_SetState(mid, S0);
+            VMId_t vm = VM_Create((mi.cpu == POWER) ? AIX : LINUX, mi.cpu);
+            VM_Attach(vm, mid);
+            vms.push_back(vm);
+            eeco_m2v[mid].push_back(vm);
+            for (unsigned c = 0; c < mi.num_cpus; c++)
+                Machine_SetCorePerformance(mid, c, P0);
+        } else if (i < run_n + inter_n) {
+            Machine_SetState(mid, S3);   // intermediate (standby)
+        } else {
+            Machine_SetState(mid, S5);   // switched off
+        }
+    }
+}
+
+void EECO_NewTask(Time_t now, TaskId_t task,
+                  vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    MachineId_t mid = EECO_FindHost(task, machines);
+    if (mid == MachineId_t(UINT_MAX)) {
+        // No running host available — queue and let PeriodicCheck promote one
+        eeco_pending.push_back(task);
+    } else {
+        VMId_t vm = EECO_EnsureVM(mid, RequiredVMType(task),
+                                   RequiredCPUType(task), vms);
+        VM_AddTask(vm, task, EECO_SLAPrio(RequiredSLA(task)));
+        eeco_task_to_vm[task] = vm;
+    }
+}
+
+void EECO_PeriodicCheck(Time_t now,
+                         vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    EECO_Rebalance(machines, vms);
+
+    vector<TaskId_t> still_pending;
+    for (TaskId_t t : eeco_pending) {
+        MachineId_t mid = EECO_FindHost(t, machines);
+        if (mid != MachineId_t(UINT_MAX)) {
+            VMId_t vm = EECO_EnsureVM(mid, RequiredVMType(t), RequiredCPUType(t), vms);
+            VM_AddTask(vm, t, EECO_SLAPrio(RequiredSLA(t)));
+            eeco_task_to_vm[t] = vm;
+        } else {
+            // Force-promote a matching host if none is running for this CPU type
+            CPUType_t rc = RequiredCPUType(t);
+            for (MachineId_t m : machines) {
+                MachineInfo_t mi = Machine_GetInfo(m);
+                // Skip if already transitioning or already in target state
+                if (eeco_transitioning.count(m)) continue;
+                if (mi.cpu == rc && mi.s_state != S0) {
+                    Machine_SetState(m, S0);
+                    for (unsigned c = 0; c < mi.num_cpus; c++)
+                        Machine_SetCorePerformance(m, c, P0);
+                    eeco_transitioning.insert(m);  // Mark as transitioning
+                    break;  // one at a time; retry next tick
+                }
+            }
+            still_pending.push_back(t);
+        }
+    }
+    eeco_pending = still_pending;
+}
+
+void EECO_TaskComplete(Time_t now, TaskId_t task,
+                        vector<MachineId_t>& machines, vector<VMId_t>& vms) {
+    eeco_task_to_vm.erase(task);
+    // Rebalance triggers demotion of now-idle hosts on the next periodic check
+}
+
+void EECO_Shutdown(vector<VMId_t>& vms) {
+    for (VMId_t vm : vms) {
+        if (VM_GetInfo(vm).active_tasks.empty()) VM_Shutdown(vm);
+    }
+}
 
 // ============================================================================
 // 3. MANDATORY SCHEDULER METHODS (The "Switch" logic)
@@ -139,6 +438,9 @@ void Scheduler::Init() {
                 greedy_m2v[mid].push_back(vm);
                 for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(mid, c, P0);
             }
+            break;
+        case EECO:
+            EECO_Init(machines, vms);
             break;
         case PABFD: /* Call PABFD_Init here */ break;
         default: break;
@@ -165,6 +467,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             greedy_task_to_vm[task_id] = vm;
         }
     }
+    else if(CURRENT_ALGO == EECO){
+        EECO_NewTask(now, task_id, machines, vms);
+    }
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -181,6 +486,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
         greedy_pending = rem;
         for (MachineId_t mid : machines) Greedy_TrySleep(mid, vms);
     }
+    else if (CURRENT_ALGO == EECO){
+        EECO_PeriodicCheck(now, machines, vms);
+    }
+    
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
@@ -192,6 +501,10 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
             Greedy_TrySleep(mid, vms);
         }
     }
+    else if (CURRENT_ALGO == EECO){
+        EECO_TaskComplete(now, task_id, machines, vms);
+    }
+    
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
@@ -221,6 +534,14 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
         greedy_waking.erase(machine_id);
         MachineInfo_t mi = Machine_GetInfo(machine_id);
         for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(machine_id, c, P0);
+    }
+    else if (CURRENT_ALGO == EECO) {
+        eeco_transitioning.erase(machine_id);  // Remove from transitioning set
+        MachineInfo_t mi = Machine_GetInfo(machine_id);
+        if (mi.s_state == S0) {
+            for (unsigned c = 0; c < mi.num_cpus; c++)
+                Machine_SetCorePerformance(machine_id, c, P0);
+        }
     }
 }
 
