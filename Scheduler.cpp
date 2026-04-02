@@ -2,6 +2,8 @@
 //  Scheduler.cpp
 //  CloudSim
 //
+//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
+//
 
 #include <cstdint>
 #include "Scheduler.hpp"
@@ -10,6 +12,7 @@
 #include <vector>
 #include <algorithm>
 #include <climits>
+#include <deque>
 #include <iostream>
 #include <string>
 #include <cmath>
@@ -17,7 +20,7 @@
 using namespace std;
 
 typedef enum { CUSTOM_GREEDY, PMAPPER, EECO, PABFD } AlgorithmType;
-static AlgorithmType CURRENT_ALGO = EECO;
+static AlgorithmType CURRENT_ALGO = PMAPPER;  // Change this to switch algorithms
 
 // ============================================================================
 // 1. CUSTOM_GREEDY IMPLEMENTATION
@@ -25,10 +28,31 @@ static AlgorithmType CURRENT_ALGO = EECO;
 
 static map<MachineId_t, vector<VMId_t>> greedy_m2v;
 static set<MachineId_t> greedy_waking;
-static vector<TaskId_t> greedy_pending;
+static map<CPUType_t, deque<TaskId_t>> greedy_pending_by_cpu;
 static set<VMId_t> greedy_migrating;
 static map<TaskId_t, VMId_t> greedy_task_to_vm;
 static unsigned greedy_rr_idx = 0;
+// Set to true whenever a task completes or a machine wakes to S0, so
+// PeriodicCheck only scans pending tasks when capacity actually changed.
+static bool greedy_retry_pending = false;
+
+// Local VM property cache.
+static map<VMId_t, VMType_t>    greedy_vm_type;
+static map<VMId_t, CPUType_t>   greedy_vm_cpu;
+static map<VMId_t, MachineId_t> greedy_vm_machine;
+static map<VMId_t, unsigned>    greedy_vm_tasks;  // count of active tasks on VM
+
+// Local machine property cache — avoids calling Machine_GetInfo in the hot path.
+struct GreedyMachineCache {
+    MachineState_t s_state;
+    CPUType_t      cpu;
+    unsigned       memory_size;
+    unsigned       memory_used;
+    unsigned       active_tasks;
+    unsigned       active_vms;
+    bool           gpus;
+};
+static map<MachineId_t, GreedyMachineCache> greedy_mc;
 
 static bool Greedy_VMCPUOk(VMType_t vm, CPUType_t cpu) {
     if (vm == AIX) return cpu == POWER;
@@ -45,13 +69,18 @@ static Priority_t Greedy_SLAPrio(SLAType_t sla) {
 static VMId_t Greedy_EnsureVM(MachineId_t mid, VMType_t vt, CPUType_t ct, vector<VMId_t>& all_vms) {
     for (VMId_t vm : greedy_m2v[mid]) {
         if (greedy_migrating.count(vm)) continue;
-        VMInfo_t vi = VM_GetInfo(vm);
-        if (vi.vm_type == vt && vi.cpu == ct) return vm;
+        if (greedy_vm_type[vm] == vt && greedy_vm_cpu[vm] == ct) return vm;
     }
     VMId_t vm = VM_Create(vt, ct);
     VM_Attach(vm, mid);
+    greedy_mc[mid].memory_used += VM_MEMORY_OVERHEAD;
+    greedy_mc[mid].active_vms++;
     all_vms.push_back(vm);
     greedy_m2v[mid].push_back(vm);
+    greedy_vm_type[vm]    = vt;
+    greedy_vm_cpu[vm]     = ct;
+    greedy_vm_machine[vm] = mid;
+    greedy_vm_tasks[vm]   = 0;
     return vm;
 }
 
@@ -71,21 +100,20 @@ static MachineId_t Greedy_BestFit(TaskId_t task, const vector<MachineId_t>& mlis
 
     for (unsigned i = 0; i < n; i++) {
         MachineId_t mid = mlist[(greedy_rr_idx + i) % n];
-        MachineInfo_t mi = Machine_GetInfo(mid);
-        if (mi.s_state != S0 || mi.cpu != rc) continue;
+        const GreedyMachineCache& mc = greedy_mc[mid];
+        if (mc.s_state != S0 || mc.cpu != rc) continue;
 
         bool has_vm = false;
         for (VMId_t vm : greedy_m2v[mid]) {
             if (greedy_migrating.count(vm)) continue;
-            VMInfo_t vi = VM_GetInfo(vm);
-            if (vi.vm_type == rv && vi.cpu == rc) { has_vm = true; break; }
+            if (greedy_vm_type[vm] == rv && greedy_vm_cpu[vm] == rc) { has_vm = true; break; }
         }
         unsigned extra = has_vm ? 0 : VM_MEMORY_OVERHEAD;
-        if (mi.memory_size < mi.memory_used + rm + extra) continue;
+        if (mc.memory_size < mc.memory_used + rm + extra) continue;
 
-        int load  = (int)mi.active_tasks;
+        int load  = (int)mc.active_tasks;
         int score = strict ? load : -load;
-        if (rg && !mi.gpus) score += 1000;
+        if (rg && !mc.gpus) score += 1000;
 
         if (score < best_score) { best = mid; best_score = score; }
     }
@@ -95,23 +123,33 @@ static MachineId_t Greedy_BestFit(TaskId_t task, const vector<MachineId_t>& mlis
 
 static void Greedy_TrySleep(MachineId_t mid, vector<VMId_t>& all_vms) {
     if (greedy_waking.count(mid)) return;
-    MachineInfo_t mi = Machine_GetInfo(mid);
-    if (mi.s_state != S0 || mi.active_tasks > 0) return;
+    GreedyMachineCache& mc = greedy_mc[mid];
+    if (mc.s_state != S0 || mc.active_tasks > 0) return;
 
     vector<VMId_t>& vlist = greedy_m2v[mid];
     vector<VMId_t> keep;
     for (VMId_t vm : vlist) {
         if (greedy_migrating.count(vm)) { keep.push_back(vm); continue; }
-        VMInfo_t vi = VM_GetInfo(vm);
-        if (vi.active_tasks.empty()) {
+        if (greedy_vm_tasks[vm] == 0) {
             VM_Shutdown(vm);
+            mc.memory_used -= VM_MEMORY_OVERHEAD;
+            mc.active_vms--;
+            greedy_vm_type.erase(vm);
+            greedy_vm_cpu.erase(vm);
+            greedy_vm_machine.erase(vm);
+            greedy_vm_tasks.erase(vm);
             all_vms.erase(remove(all_vms.begin(), all_vms.end(), vm), all_vms.end());
         } else {
             keep.push_back(vm);
         }
     }
     vlist = keep;
-    if (Machine_GetInfo(mid).active_vms == 0) Machine_SetState(mid, S5);
+    if (mc.active_vms == 0) {
+        // Use S3 (warm standby) instead of S5 so machines wake much faster
+        // when the next burst arrives. Energy cost is small relative to SLA gains.
+        Machine_SetState(mid, S3);
+        mc.s_state = S3;
+    }
 }
 
 // ============================================================================
@@ -668,10 +706,20 @@ void Scheduler::Init() {
         case CUSTOM_GREEDY:
             for (MachineId_t mid : machines) {
                 MachineInfo_t mi = Machine_GetInfo(mid);
-                VMId_t vm = VM_Create((mi.cpu == POWER) ? AIX : LINUX, mi.cpu);
+                greedy_mc[mid] = { mi.s_state, mi.cpu, mi.memory_size,
+                                   mi.memory_used, mi.active_tasks,
+                                   mi.active_vms, mi.gpus };
+                VMType_t vt = (mi.cpu == POWER) ? AIX : LINUX;
+                VMId_t vm = VM_Create(vt, mi.cpu);
                 VM_Attach(vm, mid);
+                greedy_mc[mid].memory_used += VM_MEMORY_OVERHEAD;
+                greedy_mc[mid].active_vms++;
                 vms.push_back(vm);
                 greedy_m2v[mid].push_back(vm);
+                greedy_vm_type[vm]    = vt;
+                greedy_vm_cpu[vm]     = mi.cpu;
+                greedy_vm_machine[vm] = mid;
+                greedy_vm_tasks[vm]   = 0;
                 for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(mid, c, P0);
             }
             break;
@@ -691,18 +739,26 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         MachineId_t mid = Greedy_BestFit(task_id, machines);
         if (mid == MachineId_t(UINT_MAX)) {
             CPUType_t rc = RequiredCPUType(task_id);
+            SLAType_t sla = RequiredSLA(task_id);
+            bool strict = (sla == SLA0 || sla == SLA1);
+            // For strict SLA tasks wake ALL sleeping machines of the right type
+            // immediately — a burst of SLA0/SLA1 tasks can't afford to wake one
+            // machine at a time. For non-strict, still limit to one.
             for (MachineId_t m : machines) {
                 if (greedy_waking.count(m)) continue;
-                if (Machine_GetInfo(m).cpu == rc && Machine_GetInfo(m).s_state != S0) {
+                if (greedy_mc[m].cpu == rc && greedy_mc[m].s_state != S0) {
                     Machine_SetState(m, S0);
                     greedy_waking.insert(m);
-                    break;
+                    if (!strict) break;
                 }
             }
-            greedy_pending.push_back(task_id);
+            greedy_pending_by_cpu[rc].push_back(task_id);
         } else {
             VMId_t vm = Greedy_EnsureVM(mid, RequiredVMType(task_id), RequiredCPUType(task_id), vms);
             VM_AddTask(vm, task_id, Greedy_SLAPrio(RequiredSLA(task_id)));
+            greedy_vm_tasks[vm]++;
+            greedy_mc[mid].memory_used  += GetTaskMemory(task_id);
+            greedy_mc[mid].active_tasks++;
             greedy_task_to_vm[task_id] = vm;
         }
     }
@@ -716,17 +772,38 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
 void Scheduler::PeriodicCheck(Time_t now) {
     if (CURRENT_ALGO == CUSTOM_GREEDY) {
-        vector<TaskId_t> rem;
-        for (TaskId_t t : greedy_pending) {
-            MachineId_t mid = Greedy_BestFit(t, machines);
-            if (mid != MachineId_t(UINT_MAX)) {
-                VMId_t vm = Greedy_EnsureVM(mid, RequiredVMType(t), RequiredCPUType(t), vms);
-                VM_AddTask(vm, t, Greedy_SLAPrio(RequiredSLA(t)));
-                greedy_task_to_vm[t] = vm;
-            } else rem.push_back(t);
+        bool has_pending = false;
+        for (auto& [_, bkt] : greedy_pending_by_cpu) {
+            if (!bkt.empty()) { has_pending = true; break; }
         }
-        greedy_pending = rem;
-        for (MachineId_t mid : machines) Greedy_TrySleep(mid, vms);
+        if (!greedy_retry_pending && !has_pending) return;
+        greedy_retry_pending = false;
+
+        for (auto& [cpu_type, bucket] : greedy_pending_by_cpu) {
+            if (bucket.empty()) continue;
+            // Prioritize strict-SLA tasks (SLA0/SLA1) to front of bucket.
+            stable_sort(bucket.begin(), bucket.end(), [](TaskId_t a, TaskId_t b) {
+                SLAType_t sa = RequiredSLA(a), sb = RequiredSLA(b);
+                int pa = (sa == SLA0) ? 0 : (sa == SLA1) ? 1 : (sa == SLA2) ? 2 : 3;
+                int pb = (sb == SLA0) ? 0 : (sb == SLA1) ? 1 : (sb == SLA2) ? 2 : 3;
+                return pa < pb;
+            });
+            while (!bucket.empty()) {
+                MachineId_t mid = Greedy_BestFit(bucket.front(), machines);
+                if (mid != MachineId_t(UINT_MAX)) {
+                    TaskId_t t = bucket.front();
+                    bucket.pop_front();
+                    VMId_t vm = Greedy_EnsureVM(mid, RequiredVMType(t), cpu_type, vms);
+                    VM_AddTask(vm, t, Greedy_SLAPrio(RequiredSLA(t)));
+                    greedy_vm_tasks[vm]++;
+                    greedy_mc[mid].memory_used  += GetTaskMemory(t);
+                    greedy_mc[mid].active_tasks++;
+                    greedy_task_to_vm[t] = vm;
+                } else {
+                    break;
+                }
+            }
+        }
     }
     else if (CURRENT_ALGO == PMAPPER) {
         PMapper_PeriodicCheck(now, machines, vms);
@@ -740,9 +817,14 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     if (CURRENT_ALGO == CUSTOM_GREEDY) {
         auto it = greedy_task_to_vm.find(task_id);
         if (it != greedy_task_to_vm.end()) {
-            MachineId_t mid = VM_GetInfo(it->second).machine_id;
+            VMId_t vm = it->second;
+            MachineId_t mid = greedy_vm_machine[vm];
+            greedy_vm_tasks[vm]--;
+            greedy_mc[mid].memory_used  -= GetTaskMemory(task_id);
+            greedy_mc[mid].active_tasks--;
             greedy_task_to_vm.erase(it);
             Greedy_TrySleep(mid, vms);
+            greedy_retry_pending = true;
         }
     }
     else if (CURRENT_ALGO == PMAPPER) {
@@ -761,6 +843,11 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 void Scheduler::Shutdown(Time_t time) {
     if (CURRENT_ALGO == PMAPPER) { PMapper_Shutdown(vms); return; }
     for (VMId_t vm : vms) {
+        if (CURRENT_ALGO == CUSTOM_GREEDY) {
+            MachineId_t mid = greedy_vm_machine.count(vm) ? greedy_vm_machine[vm]
+                                                           : MachineId_t(UINT_MAX);
+            if (mid != MachineId_t(UINT_MAX) && greedy_mc[mid].s_state != S0) continue;
+        }
         if (VM_GetInfo(vm).active_tasks.empty()) VM_Shutdown(vm);
     }
 }
@@ -775,13 +862,32 @@ void HandleTaskCompletion(Time_t time, TaskId_t task_id) { theScheduler.TaskComp
 void MemoryWarning(Time_t time, MachineId_t machine_id) { }
 void MigrationDone(Time_t time, VMId_t vm_id) { theScheduler.MigrationComplete(time, vm_id); }
 void SchedulerCheck(Time_t time) { theScheduler.PeriodicCheck(time); }
-void SLAWarning(Time_t time, TaskId_t task_id) { SetTaskPriority(task_id, HIGH_PRIORITY); }
+void SLAWarning(Time_t time, TaskId_t task_id) {
+    SetTaskPriority(task_id, HIGH_PRIORITY);
+    if (CURRENT_ALGO == CUSTOM_GREEDY) {
+        CPUType_t rc = RequiredCPUType(task_id);
+        unsigned total = Machine_GetTotal();
+        for (unsigned i = 0; i < total; i++) {
+            MachineId_t m = MachineId_t(i);
+            if (greedy_waking.count(m)) continue;
+            if (greedy_mc[m].cpu == rc && greedy_mc[m].s_state != S0) {
+                Machine_SetState(m, S0);
+                greedy_waking.insert(m);
+            }
+        }
+        greedy_retry_pending = true;
+    }
+}
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     if (CURRENT_ALGO == CUSTOM_GREEDY) {
         greedy_waking.erase(machine_id);
         MachineInfo_t mi = Machine_GetInfo(machine_id);
-        for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(machine_id, c, P0);
+        greedy_mc[machine_id].s_state = mi.s_state;
+        if (mi.s_state == S0) {
+            for (unsigned c = 0; c < mi.num_cpus; c++) Machine_SetCorePerformance(machine_id, c, P0);
+            greedy_retry_pending = true;
+        }
     }
     else if (CURRENT_ALGO == PMAPPER) {
         pm_transitioning.erase(machine_id);
@@ -802,10 +908,14 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
 }
 
 void SimulationComplete(Time_t time) {
+    // This function is called before the simulation terminates Add whatever you feel like.
+    cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
-    cout << "SLA3: " << GetSLAReport(SLA3) << "%" << endl;
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
+    cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
+    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
+
     theScheduler.Shutdown(time);
 }
