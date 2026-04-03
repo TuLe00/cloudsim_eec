@@ -1479,7 +1479,8 @@ void SimulationComplete(Time_t time) {
     cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
+    cout << "SLA3: " << GetSLAReport(SLA3) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
