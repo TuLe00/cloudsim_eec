@@ -222,7 +222,7 @@ static MachineId_t Greedy_BestFit(TaskId_t task, const vector<MachineId_t>& mlis
     unsigned best_perf = Greedy_MaxPerf(rc, rg, true);
     bool prefer_fast_tier = strict && best_perf != 0 && Greedy_HasFastPreferredCapacity(task);
     bool prefer_reserved = (sla != SLA0) && Greedy_HasPreferredReservation(task, true);
-    bool avoid_reserved  = (sla == SLA0) && Greedy_HasPreferredReservation(task, false);
+    bool avoid_reserved  = (sla == SLA0);  // SLA0 is strictly forbidden from reserved machines
 
     if (!Greedy_VMCPUOk(rv, rc)) return MachineId_t(UINT_MAX);
 
@@ -367,7 +367,7 @@ void Scheduler::Init() {
             if (ma.perf0 != mb.perf0) return ma.perf0 > mb.perf0;
             return a < b;
         });
-        unsigned reserve = tier.size() >= 4 ? 1u : 0u;
+        unsigned reserve = tier.size() >= 8 ? 2u : (tier.size() >= 4 ? 1u : 0u);
         for (unsigned i = 0; i < reserve && i < tier.size(); i++)
             greedy_latency_reserved.insert(tier[i]);
     }
