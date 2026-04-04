@@ -119,6 +119,13 @@ static VMId_t EECO_EnsureVM(MachineId_t mid, TaskId_t task, vector<VMId_t>& all_
     if (best_vm != VMId_t(UINT_MAX) && (!strict || best_load == 0 || !can_add_vm))
         return best_vm;
 
+    // --- NEW: ensure the real machine is actually S0 before creating/attaching VMs
+    MachineInfo_t real_mi = Machine_GetInfo(mid);
+    if (real_mi.s_state != S0) {
+        return VMId_t(UINT_MAX);
+    }
+    // --- end new check
+
     VMId_t vm = VM_Create(vt, ct);
     VM_Attach(vm, mid);
     all_vms.push_back(vm);
@@ -256,8 +263,19 @@ static void EECO_WakeMachines(const vector<MachineId_t>& machines,
     wake_pass(false, false);
 }
 
-static void EECO_PlaceTask(TaskId_t task, MachineId_t mid, vector<VMId_t>& vms) {
+// place a task onto a machine; return true on success, false if machine not ready
+static bool EECO_PlaceTask(TaskId_t task, MachineId_t mid, vector<VMId_t>& vms) {
     VMId_t vm = EECO_EnsureVM(mid, task, vms);
+    if (vm == VMId_t(UINT_MAX)) {
+        // machine not ready; ensure we're waking it and request a retry
+        if (!eeco_transitioning.count(mid)) {
+            Machine_SetState(mid, S0);
+            eeco_transitioning.insert(mid);
+        }
+        eeco_retry_pending = true;
+        return false;
+    }
+
     SLAType_t sla = RequiredSLA(task);
     VM_AddTask(vm, task, EECO_SLAPrio(sla));
     eeco_task_to_vm[task] = vm;
@@ -269,11 +287,11 @@ static void EECO_PlaceTask(TaskId_t task, MachineId_t mid, vector<VMId_t>& vms) 
     eeco_mc[mid].memory_used += tm;
 
     if (sla == SLA0 || sla == SLA1) eeco_strict_active++;
+    return true;
 }
 
 static void EECO_Rebalance(Time_t now, const vector<MachineId_t>& mlist, vector<VMId_t>& all_vms) {
-    unsigned total = (unsigned)mlist.size();
-    if (total == 0) return;
+    if (mlist.empty()) return;
 
     bool has_strict_pending = false;
     for (auto& [_, bucket] : eeco_pending_by_cpu) {
@@ -288,131 +306,144 @@ static void EECO_Rebalance(Time_t now, const vector<MachineId_t>& mlist, vector<
     for (auto& [_, bucket] : eeco_pending_by_cpu)
         if (!bucket.empty()) { has_pending = true; break; }
 
-    vector<MachineId_t> running, intermediate, off_hosts;
-    for (MachineId_t mid : mlist) {
-        MachineState_t s = eeco_mc[mid].s_state;
-        if      (s == S0) running.push_back(mid);
-        else if (s == S3) intermediate.push_back(mid);
-        else              off_hosts.push_back(mid);
-    }
-
-
+    // When strict tasks are active or pending, wake every machine immediately
+    // so capacity is available with minimum latency.
     if (eeco_strict_active > 0 || has_strict_pending || now < eeco_strict_until) {
-        for (MachineId_t mid : intermediate) {
-            if (!eeco_transitioning.count(mid)) {
+        for (MachineId_t mid : mlist) {
+            if (!eeco_transitioning.count(mid) && eeco_mc[mid].s_state != S0)
                 EECO_WakeMachineAndTrack(mid);
-            }
-        }
-        for (MachineId_t mid : off_hosts) {
-            if (!eeco_transitioning.count(mid)) {
-                EECO_WakeMachineAndTrack(mid);
-            }
         }
         return;
     }
 
-    unsigned N_run_cur = (unsigned)running.size();
+    // ---- Per-CPU-type scaling -----------------------------------------------
+    // Running the utilisation formula across all CPU types together causes
+    // over-demotion: e.g. long-running POWER HPC tasks inflate the cluster
+    // utilisation, so EECO thinks it needs many machines running overall —
+    // but the X86 machines (which serve X86 SLA0/SLA1 spikes) get demoted
+    // because they're individually idle.  Fix: rebalance each CPU type
+    // independently so each type tracks only its own load.
+    // -------------------------------------------------------------------------
+    map<CPUType_t, vector<MachineId_t>> by_cpu;
+    for (MachineId_t mid : mlist) by_cpu[eeco_mc[mid].cpu].push_back(mid);
 
-    unsigned cap_sum = 0, task_sum = 0;
-    for (MachineId_t mid : running) {
-        cap_sum  += eeco_mc[mid].num_cpus;
-        task_sum += eeco_mc[mid].active_tasks;
-    }
-    double U_cur = (cap_sum > 0) ? (double)task_sum / (double)cap_sum : 0.0;
+    for (auto& [cpu, cpu_machines] : by_cpu) {
+        unsigned n_total = (unsigned)cpu_machines.size();
 
-    unsigned N_run_floor  = max(1u, (unsigned)ceil(total * EECO_MIN_RUN_FRAC));
-    unsigned N_run_target;
-    if (U_cur == 0.0) N_run_target = N_run_floor;
-    else {
-        N_run_target = (unsigned)ceil((U_cur / EECO_U_TARGET) * (double)N_run_cur);
-        N_run_target = max(N_run_floor, N_run_target);
-    }
-    if (has_pending) N_run_target = max(N_run_target, N_run_cur);
-    N_run_target = max(1u, min(N_run_target, total));
-
-    unsigned headroom      = total - N_run_target;
-    unsigned N_inter_target = min((unsigned)ceil(EECO_ALPHA * (double)N_run_target), headroom);
-
-    if (N_run_cur < N_run_target) {
-        unsigned need = N_run_target - N_run_cur;
-        for (unsigned i = 0; i < need && i < intermediate.size(); i++) {
-            MachineId_t mid = intermediate[i];
-            if (!eeco_transitioning.count(mid)) { EECO_WakeMachineAndTrack(mid); }
+        vector<MachineId_t> running, intermediate, off_hosts;
+        for (MachineId_t mid : cpu_machines) {
+            MachineState_t s = eeco_mc[mid].s_state;
+            if      (s == S0) running.push_back(mid);
+            else if (s == S3) intermediate.push_back(mid);
+            else              off_hosts.push_back(mid);
         }
-        if (need > intermediate.size()) {
-            unsigned still_need = need - (unsigned)intermediate.size();
-            for (unsigned i = 0; i < still_need && i < off_hosts.size(); i++) {
-                MachineId_t mid = off_hosts[i];
-                if (!eeco_transitioning.count(mid)) { EECO_WakeMachineAndTrack(mid); }
+        unsigned N_run_cur = (unsigned)running.size();
+
+        // Utilisation based only on this CPU type's machines and tasks.
+        unsigned cap_sum = 0, task_sum = 0;
+        for (MachineId_t mid : running) {
+            cap_sum  += eeco_mc[mid].num_cpus;
+            task_sum += eeco_mc[mid].active_tasks;
+        }
+        double U_cur = cap_sum > 0 ? (double)task_sum / (double)cap_sum : 0.0;
+
+        unsigned N_run_floor = max(EECO_MIN_RUN_PER_CPU,
+                                   (unsigned)ceil(n_total * EECO_MIN_RUN_FRAC));
+        unsigned N_run_target;
+        if (U_cur == 0.0) N_run_target = N_run_floor;
+        else {
+            N_run_target = (unsigned)ceil((U_cur / EECO_U_TARGET) * (double)N_run_cur);
+            N_run_target = max(N_run_floor, N_run_target);
+        }
+
+        // Don't shrink if tasks of this CPU type are pending.
+        bool cpu_pending = eeco_pending_by_cpu.count(cpu) &&
+                           !eeco_pending_by_cpu.at(cpu).empty();
+        if (cpu_pending || has_pending) N_run_target = max(N_run_target, N_run_cur);
+        N_run_target = max(1u, min(N_run_target, n_total));
+
+        // Wake machines to reach N_run_target.
+        if (N_run_cur < N_run_target) {
+            unsigned need = N_run_target - N_run_cur;
+            for (unsigned i = 0; i < need && i < intermediate.size(); i++)
+                if (!eeco_transitioning.count(intermediate[i]))
+                    EECO_WakeMachineAndTrack(intermediate[i]);
+            if (need > intermediate.size()) {
+                unsigned still_need = need - (unsigned)intermediate.size();
+                for (unsigned i = 0; i < still_need && i < off_hosts.size(); i++)
+                    if (!eeco_transitioning.count(off_hosts[i]))
+                        EECO_WakeMachineAndTrack(off_hosts[i]);
             }
         }
-    }
 
-    // promote S3→S0 if needed
-    unsigned inter_cur = (unsigned)intermediate.size();
-    if (inter_cur < N_inter_target) {
-        unsigned need = N_inter_target - inter_cur;
-        for (unsigned i = 0; i < need && i < off_hosts.size(); i++) {
-            MachineId_t mid = off_hosts[i];
-            if (!eeco_transitioning.count(mid)) { Machine_SetState(mid, S3); eeco_transitioning.insert(mid); }
+        // Promote S5→S3 headroom buffer.
+        unsigned headroom       = n_total - N_run_target;
+        unsigned N_inter_target = min((unsigned)ceil(EECO_ALPHA * (double)N_run_target), headroom);
+        unsigned inter_cur      = (unsigned)intermediate.size();
+        if (inter_cur < N_inter_target) {
+            unsigned need = N_inter_target - inter_cur;
+            for (unsigned i = 0; i < need && i < off_hosts.size(); i++)
+                if (!eeco_transitioning.count(off_hosts[i])) {
+                    Machine_SetState(off_hosts[i], S3);
+                    eeco_transitioning.insert(off_hosts[i]);
+                }
         }
-    }
 
-    if (!has_pending && N_run_cur > N_run_target) {
-        
-        map<CPUType_t, unsigned> cpu_run_count;
-        for (MachineId_t mid : running) cpu_run_count[eeco_mc[mid].cpu]++;
+        // Demote idle over-provisioned running machines → S3.
+        if (!cpu_pending && !has_pending && N_run_cur > N_run_target) {
+            vector<pair<unsigned, MachineId_t>> candidates;
+            for (MachineId_t mid : running)
+                candidates.push_back({eeco_mc[mid].active_tasks, mid});
+            sort(candidates.begin(), candidates.end());
 
-        vector<pair<unsigned, MachineId_t>> candidates;
-        for (MachineId_t mid : running)
-            candidates.push_back({eeco_mc[mid].active_tasks, mid});
-        sort(candidates.begin(), candidates.end());
+            unsigned demoted = 0;
+            unsigned surplus = min(N_run_cur - N_run_target, EECO_MAX_DEMOTE);
+            for (auto& [tasks, mid] : candidates) {
+                if (demoted >= surplus) break;
+                if (eeco_transitioning.count(mid) || tasks > 0) continue;
+                if (N_run_cur - demoted <= EECO_MIN_RUN_PER_CPU) break;
 
-        unsigned demoted = 0;
-        unsigned surplus = min(N_run_cur - N_run_target, EECO_MAX_DEMOTE);
-        for (auto& [tasks, mid] : candidates) {
-            if (demoted >= surplus) break;
-            if (eeco_transitioning.count(mid) || tasks > 0) continue;
-            CPUType_t cpu = eeco_mc[mid].cpu;
-            if (cpu_run_count[cpu] <= EECO_MIN_RUN_PER_CPU) continue;
+                vector<VMId_t> keep;
+                for (VMId_t vm : eeco_m2v[mid]) {
+                    if (eeco_vc[vm].task_count == 0) {
+                        eeco_mc[mid].memory_used -= eeco_vc[vm].memory_used;
+                        eeco_mc[mid].active_vms--;
+                        eeco_vc.erase(vm);
+                        VM_Shutdown(vm);
+                        all_vms.erase(remove(all_vms.begin(), all_vms.end(), vm),
+                                      all_vms.end());
+                    } else { keep.push_back(vm); }
+                }
+                eeco_m2v[mid] = keep;
 
-            vector<VMId_t> keep;
-            for (VMId_t vm : eeco_m2v[mid]) {
-                if (eeco_vc[vm].task_count == 0) {
-                    eeco_mc[mid].memory_used -= eeco_vc[vm].memory_used;
-                    eeco_mc[mid].active_vms--;
-                    eeco_vc.erase(vm);
-                    VM_Shutdown(vm);
-                    all_vms.erase(remove(all_vms.begin(), all_vms.end(), vm), all_vms.end());
-                } else { keep.push_back(vm); }
-            }
-            eeco_m2v[mid] = keep;
-
-            if (eeco_mc[mid].active_vms == 0) {
-                Machine_SetState(mid, S3);
-                eeco_mc[mid].s_state = S3;
-                eeco_transitioning.insert(mid);
-                cpu_run_count[cpu]--;
-                demoted++;
+                if (eeco_mc[mid].active_vms == 0) {
+                    Machine_SetState(mid, S3);
+                    eeco_mc[mid].s_state = S3;
+                    eeco_transitioning.insert(mid);
+                    demoted++;
+                }
             }
         }
-    }
 
-    if (!has_pending) {
-        vector<MachineId_t> inter_now;
-        for (MachineId_t mid : mlist)
-            if (eeco_mc[mid].s_state == S3 && !eeco_transitioning.count(mid))
-                inter_now.push_back(mid);
+        // Demote excess S3 machines → S5.
+        if (!cpu_pending && !has_pending) {
+            vector<MachineId_t> inter_now;
+            for (MachineId_t mid : cpu_machines)
+                if (eeco_mc[mid].s_state == S3 && !eeco_transitioning.count(mid))
+                    inter_now.push_back(mid);
 
-        if ((unsigned)inter_now.size() > N_inter_target) {
-            unsigned surplus = min((unsigned)inter_now.size() - N_inter_target, EECO_MAX_DEMOTE);
-            for (unsigned i = 0; i < surplus && i < inter_now.size(); i++) {
-                MachineId_t mid = inter_now[i];
-                if (eeco_transitioning.count(mid)) continue;
-                if (eeco_mc[mid].gpus) continue;    // GPU machines stay at S3
-                Machine_SetState(mid, S5);
-                eeco_mc[mid].s_state = S5;
-                eeco_transitioning.insert(mid);
+            unsigned N_inter_cap = min((unsigned)ceil(EECO_ALPHA * (double)N_run_target),
+                                       n_total - N_run_target);
+            if ((unsigned)inter_now.size() > N_inter_cap) {
+                unsigned surplus = min((unsigned)inter_now.size() - N_inter_cap, EECO_MAX_DEMOTE);
+                for (unsigned i = 0; i < surplus && i < inter_now.size(); i++) {
+                    MachineId_t mid = inter_now[i];
+                    if (eeco_transitioning.count(mid)) continue;
+                    if (eeco_mc[mid].gpus) continue;  // GPU machines stay at S3
+                    Machine_SetState(mid, S5);
+                    eeco_mc[mid].s_state = S5;
+                    eeco_transitioning.insert(mid);
+                }
             }
         }
     }
@@ -422,7 +453,6 @@ static void EECO_DrainPending(vector<MachineId_t>& machines, vector<VMId_t>& vms
     for (auto& [cpu_type, bucket] : eeco_pending_by_cpu) {
         if (bucket.empty()) continue;
 
-        // use shared comparator
         stable_sort(bucket.begin(), bucket.end(), EECO_TaskCmp);
 
         deque<TaskId_t> retry;
@@ -430,7 +460,12 @@ static void EECO_DrainPending(vector<MachineId_t>& machines, vector<VMId_t>& vms
             TaskId_t task = bucket.front(); bucket.pop_front();
             MachineId_t mid = EECO_FindHost(Now(), task, machines);
             if (mid != MachineId_t(UINT_MAX)) {
-                EECO_PlaceTask(task, mid, vms);
+                if (!EECO_PlaceTask(task, mid, vms)) {
+                    // placement failed because machine not ready — move task to retry and stop
+                    retry.push_back(task);
+                    while (!bucket.empty()) { retry.push_back(bucket.front()); bucket.pop_front(); }
+                    break;
+                }
             } else {
                 SLAType_t sla = RequiredSLA(task);
                 bool gpu_task = IsTaskGPUCapable(task);
@@ -485,9 +520,20 @@ void EECO_NewTask(Time_t now, TaskId_t task, vector<MachineId_t>& machines, vect
     MachineId_t mid = EECO_FindHost(now, task, machines);
     if (mid == MachineId_t(UINT_MAX)) {
         if (!strict) EECO_WakeMachines(machines, rc, false, gpu_task, !gpu_task);
-        eeco_pending_by_cpu[rc].push_back(task);
+        // strict tasks should be prioritized: push front and attempt immediate rebalance/drain
+        if (strict) {
+            eeco_pending_by_cpu[rc].push_front(task);
+            EECO_Rebalance(now, machines, vms);
+            EECO_DrainPending(machines, vms);
+            eeco_retry_pending = true;
+        } else {
+            eeco_pending_by_cpu[rc].push_back(task);
+        }
     } else {
-        EECO_PlaceTask(task, mid, vms);
+        if (!EECO_PlaceTask(task, mid, vms)) {
+            // fallback: put into pending to be retried
+            eeco_pending_by_cpu[rc].push_front(task);
+        }
     }
 }
 
